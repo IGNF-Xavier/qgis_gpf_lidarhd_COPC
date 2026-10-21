@@ -42,6 +42,20 @@ Points d'attention :
 - **Mode strict** : si une dalle nécessaire est illisible, le traitement s'arrête et aucun COPC incomplet n'est produit.
 - **Stratégie d'URL** : *chunk* d'abord, URL WFS originale en repli (une seconde pipeline est reconstruite).
 
+## Vues 3D LiDAR (0.6.0, expérimental)
+
+Menu *Extensions › LiDAR HD Géoplateforme › Vues 3D LiDAR* : un panneau pour comparer 1 à 5 vues 3D d'une même dalle COPC,
+chacune avec sa couche (clone, sans copie de données), ses couleurs et sa caméra. Prérequis : QGIS ≥ 3.40.
+
+- **Vues** : taille des points, qualité (1 / 2 / 5 M de points), relief EDL, rendu en triangles, recentrage, filtre de points
+  (attribut, opérateur, valeur), tableau des *valeurs visibles* (« Classer » donne les pourcentages).
+- **Histo** : champ coloré, plage affichée (classes hors plage en gris pour la classification), saturation des rampes, histogramme.
+- **Synchro** : caméras synchronisées, mode *Complet* ou *Position seule*.
+
+Limites de cette version : histogramme et « Classer » calculés sur un échantillon (`pdal translate` + décimation, fichier local seulement) ;
+réglage des plages par champs numériques (pas de poignées sur l'histogramme) ; pas encore de découpage, de MNT, d'outils par vue
+ni de sauvegarde des vues dans le projet. Testé sur QGIS 3.40.4.
+
 ## Installation
 
 Télécharger `lidar_hd_geoplateforme_<version>.zip` depuis les [Releases](https://github.com/IGNF-Xavier/qgis_gpf_lidarhd_COPC/releases),
