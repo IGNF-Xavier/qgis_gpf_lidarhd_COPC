@@ -214,7 +214,8 @@ class ExtractEditionsAlgorithm(Base):
                 raise QgsProcessingException('=== TROU DE COUVERTURE CONFIRMÉ PAR L’EXTRACTION RÉELLE — MODE STRICT ===\nProduction : '+edition+'\nAucun COPC incomplet ne sera produit.\n'+details)
             size=os.path.getsize(output);f.pushInfo(f'Édition {edition} terminée avec {strategy} : {duration:.1f} s, {size/1048576:.1f} Mio');results.append({'production':edition,'selection_method':selection_method,'catalogue_editions':sorted(set(r.edition for r in records),reverse=True),'resource_dates':sorted(set(r.resource_date for r in records if r.resource_date),reverse=True),'output':output,'pipeline':pipeline,'sources':len(records),'url_strategy':strategy,'range_preflight':range_checks,'source_diagnostics':source_diagnostics,'attempts':attempts,'duration_seconds':round(duration,1),'size_bytes':size});f.setProgress(int(base+span*edition_index))
             if self.parameterAsBool(p,self.L,c):
-                layer=QgsPointCloudLayer(output,f'{prefix}_{edition}','pdal')
+                layer=QgsPointCloudLayer(output,f'{prefix}_{edition}','copc')
+                if not layer.isValid():layer=QgsPointCloudLayer(output,f'{prefix}_{edition}','pdal')
                 if layer.isValid():c.temporaryLayerStore().addMapLayer(layer);c.addLayerToLoadOnCompletion(layer.id(),QgsProcessingContext.LayerDetails(f'{prefix}_{edition}',c.project(),self.OUT))
                 else:f.reportError('COPC créé mais chargement impossible : '+output,False)
         manifest=os.path.join(folder,prefix+'_manifest.json')

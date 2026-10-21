@@ -8,7 +8,7 @@ import tempfile
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, QThread, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QPainter
-from qgis.PyQt.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
+from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDockWidget, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
                                  QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
                                  QTabWidget, QVBoxLayout, QWidget)
 from qgis.core import (Qgis, QgsColorRampShader, QgsMapLayerProxyModel, QgsPointCloudCategory, QgsPointCloudClassifiedRenderer,
@@ -21,6 +21,7 @@ from .views3d_logic import (GRAY, MAX_VIEWS, QUALITY, OPERATORS, ViewSettings, c
                             poses_close, valid_range)
 
 TAG = 'Vues 3D LiDAR'
+CLONE_PROPERTY = 'lidarhd_3d_view_clone'
 SCENE_NAMES = {i: f'Vue {i}' for i in range(1, MAX_VIEWS + 1)}
 
 
@@ -101,7 +102,11 @@ class ViewsPanel(QDockWidget):
         self.sample, self.sampler, self._loading = None, None, False
         self._syncing = False
         self._pending = {}
+        self.windows = {}
+        for stale in [l for l in QgsProject.instance().mapLayers().values() if l.customProperty(CLONE_PROPERTY)]:
+            QgsProject.instance().removeMapLayer(stale.id())  # clones orphelins d'une session précédente
         self._build()
+        QgsProject.instance().layerWasAdded.connect(self._layer_added)
 
     # ------------------------------------------------------------------ interface
     def _build(self):
@@ -114,6 +119,11 @@ class ViewsPanel(QDockWidget):
         self.cloud = QgsMapLayerComboBox()
         self.cloud.setFilters(QgsMapLayerProxyModel.PointCloudLayer)
         self.cloud.layerChanged.connect(self._cloud_changed)
+        fetch = QPushButton('Récupérer une dalle COPC (emprise de la carte)…')
+        fetch.setToolTip('Ouvre le traitement « Extraire un COPC par édition » avec l’emprise courante de la carte 2D ; '
+                         'le COPC produit est chargé dans le projet puis proposé dans la liste Nuage.')
+        fetch.clicked.connect(self.fetch_copc)
+        form.addRow(fetch)
         form.addRow('Nuage', self.cloud)
         self.count = QSpinBox()
         self.count.setRange(1, MAX_VIEWS)
@@ -257,22 +267,32 @@ class ViewsPanel(QDockWidget):
 
     def open_current(self):
         self.open_view(self.current())
+        window = self.windows.get(self.current())
+        if window is not None and not sip.isdeleted(window):
+            window.show(); window.raise_()
 
     def open_view(self, i):
         source = self._source()
         if source is None or not source.isValid():
             self.iface.messageBar().pushWarning(TAG, 'Choisir un nuage de points COPC valide.')
             return
+        self._purge_dead()
         if i in self.canvases:
             return
+        if source.customProperty(CLONE_PROPERTY):
+            return
         layer = source.clone()
+        layer.setCustomProperty(CLONE_PROPERTY, '1')
         layer.setName(f'{source.name()} — {SCENE_NAMES[i]}')
         QgsProject.instance().addMapLayer(layer, False)
+        before = set(QApplication.topLevelWidgets())
         canvas = self.iface.createNewMapCanvas3D(SCENE_NAMES[i])
         if canvas is None:
             QgsMessageLog.logMessage('createNewMapCanvas3D a échoué', TAG, Qgis.Warning)
             return
         self.layers[i], self.canvases[i] = layer, canvas
+        self._show_window(i, [w for w in QApplication.topLevelWidgets() if w not in before and isinstance(w, QDialog)], source.name())
+        self._hide_clones_from_combo()
         settings = canvas.mapSettings()
         settings.setCrs(layer.crs())
         settings.setExtent(layer.extent())
@@ -285,11 +305,60 @@ class ViewsPanel(QDockWidget):
         if i in self.canvases:
             self._drop_view(i)
 
+    def _show_window(self, i, dialogs, name):
+        """QGIS nomme la fenêtre « Carte 3D N » et la crée flottante : titre explicite, taille, position en cascade, premier plan."""
+        if not dialogs:
+            return
+        window = next((w for w in dialogs if w.metaObject().className() == 'QDialog' and (w.windowTitle().startswith('Carte 3D') or w.windowTitle() == SCENE_NAMES[i])), None)  # exclut la boîte de mesure 3D
+        if window is None:
+            return
+        window.setWindowTitle(f'{SCENE_NAMES[i]} — {name}')
+        window.resize(720, 600)
+        geometry = self.iface.mainWindow().frameGeometry()
+        window.move(geometry.left() + 80 + 40 * (i - 1), geometry.top() + 120 + 40 * (i - 1))
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self.windows[i] = window
+
+    def fetch_copc(self):
+        """Lance l'algorithme d'extraction (interface Processing complète) avec l'emprise de la carte 2D."""
+        import processing
+        canvas = self.iface.mapCanvas()
+        extent, crs = canvas.extent(), canvas.mapSettings().destinationCrs()
+        text = f'{extent.xMinimum()},{extent.xMaximum()},{extent.yMinimum()},{extent.yMaximum()} [{crs.authid()}]'
+        processing.execAlgorithmDialog('lidarhd_geoplateforme:extract_editions',
+                                       {'EXTENT': text, 'EDITION_MODE': 1, 'RESOLUTION': 0.5, 'LOAD': True})
+
+    def _layer_added(self, layer):
+        """Un nuage de points qui vient d'être chargé (ex. COPC extrait) devient le nuage proposé."""
+        if isinstance(layer, QgsPointCloudLayer) and not layer.customProperty(CLONE_PROPERTY):
+            QTimer.singleShot(500, lambda: self.cloud.setLayer(layer) if not (sip.isdeleted(self.cloud) or sip.isdeleted(layer)) else None)
+
+    def _hide_clones_from_combo(self):
+        self.cloud.setExceptedLayerList([l for l in QgsProject.instance().mapLayers().values() if l.customProperty(CLONE_PROPERTY)])
+
+    def _purge_dead(self):
+        """Vues dont la fenêtre 3D a été détruite (fermée par sa croix) : on libère leur clone, elles pourront être rouvertes."""
+        for i in [i for i, c in self.canvases.items() if sip.isdeleted(c)]:
+            layer = self.layers.pop(i, None)
+            del self.canvases[i]
+            self._pending.pop(i, None)
+            if layer is not None and not sip.isdeleted(layer):
+                layer_id = layer.id()
+                QTimer.singleShot(4000, lambda layer_id=layer_id: QgsProject.instance().removeMapLayer(layer_id))
+
     def _drop_view(self, i):
+        if sip.isdeleted(self.canvases[i]):
+            self._purge_dead()
+            return
         """Ferme la vue puis retire la couche clonée APRÈS la destruction asynchrone de la scène 3D (sinon plantage QGIS)."""
         layer_id = self.layers[i].id()
         self._pending.pop(i, None)
+        window = self.windows.pop(i, None)
         self.iface.closeMapCanvas3D(SCENE_NAMES[i])
+        if window is not None and not sip.isdeleted(window):
+            window.close()
         del self.canvases[i], self.layers[i]
         QTimer.singleShot(4000, lambda: QgsProject.instance().removeMapLayer(layer_id))
 
