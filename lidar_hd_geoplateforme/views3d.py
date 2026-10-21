@@ -11,7 +11,7 @@ from qgis.PyQt.QtGui import QColor, QPainter
 from qgis.PyQt.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDockWidget, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
                                  QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
                                  QTabWidget, QVBoxLayout, QWidget)
-from qgis.core import (Qgis, QgsColorRampShader, QgsMapLayerProxyModel, QgsPointCloudCategory, QgsPointCloudClassifiedRenderer,
+from qgis.core import (Qgis, QgsCoordinateReferenceSystem, QgsColorRampShader, QgsMapLayerProxyModel, QgsPointCloudCategory, QgsPointCloudClassifiedRenderer,
                        QgsPointCloudLayer, QgsProject, QgsStyle, QgsMessageLog)
 from qgis.gui import QgsMapLayerComboBox
 import qgis._3d as q3
@@ -22,6 +22,7 @@ from .views3d_logic import (GRAY, MAX_VIEWS, QUALITY, OPERATORS, ViewSettings, c
 
 TAG = 'Vues 3D LiDAR'
 CLONE_PROPERTY = 'lidarhd_3d_view_clone'
+TECH_GROUP = 'Vues 3D LiDAR (couches techniques)'
 SCENE_NAMES = {i: f'Vue {i}' for i in range(1, MAX_VIEWS + 1)}
 
 
@@ -281,24 +282,51 @@ class ViewsPanel(QDockWidget):
             return
         if source.customProperty(CLONE_PROPERTY):
             return
-        layer = source.clone()
+        # Nouvelle couche sur la même source (et non clone()) : un clone n'était pas rendu dans la scène 3D.
+        options = QgsPointCloudLayer.LayerOptions(QgsProject.instance().transformContext())
+        layer = QgsPointCloudLayer(source.source(), source.name(), source.providerType(), options)
+        if not layer.isValid():
+            self.iface.messageBar().pushWarning(TAG, 'Impossible de relire le nuage pour la vue ' + str(i))
+            return
         layer.setCustomProperty(CLONE_PROPERTY, '1')
         layer.setName(f'{source.name()} — {SCENE_NAMES[i]}')
+        # Couche technique ajoutée à l'arbre (décochée) : c'est le cas des couches des cartes 3D natives de QGIS.
         QgsProject.instance().addMapLayer(layer, False)
+        group = self._technical_group()
+        node = group.addLayer(layer)
+        node.setItemVisibilityChecked(False)
+        self.layers[i] = layer
+        self._apply_layer(i)  # rendu 3D prêt AVANT la création de la scène
         before = set(QApplication.topLevelWidgets())
         canvas = self.iface.createNewMapCanvas3D(SCENE_NAMES[i])
         if canvas is None:
             QgsMessageLog.logMessage('createNewMapCanvas3D a échoué', TAG, Qgis.Warning)
+            del self.layers[i]
             return
-        self.layers[i], self.canvases[i] = layer, canvas
+        self.canvases[i] = canvas
         self._show_window(i, [w for w in QApplication.topLevelWidgets() if w not in before and isinstance(w, QDialog)], source.name())
         self._hide_clones_from_combo()
-        settings = canvas.mapSettings()
-        settings.setCrs(layer.crs())
-        settings.setExtent(layer.extent())
-        self.apply(i)
         canvas.cameraController().cameraChanged.connect(lambda i=i: self._camera_changed(i))
-        self._recenter(i)
+        QTimer.singleShot(800, lambda i=i: self._attach(i))      # scène initialisée puis couche attachée
+        QTimer.singleShot(2500, lambda i=i: self._recenter(i))   # caméra après chargement des premiers nœuds
+
+    @staticmethod
+    def _remove_clone(layer_id):
+        QgsProject.instance().removeMapLayer(layer_id)
+        root = QgsProject.instance().layerTreeRoot()
+        group = root.findGroup(TECH_GROUP)
+        if group is not None and not group.children():
+            root.removeChildNode(group)
+
+    def _technical_group(self):
+        root = QgsProject.instance().layerTreeRoot()
+        group = root.findGroup(TECH_GROUP) or root.addGroup(TECH_GROUP)
+        group.setExpanded(False)
+        return group
+
+    def _attach(self, i):
+        if i in self.canvases and not sip.isdeleted(self.canvases[i]):
+            self._apply_now(i)
 
     def close_current(self):
         i = self.current()
@@ -346,7 +374,7 @@ class ViewsPanel(QDockWidget):
             self._pending.pop(i, None)
             if layer is not None and not sip.isdeleted(layer):
                 layer_id = layer.id()
-                QTimer.singleShot(4000, lambda layer_id=layer_id: QgsProject.instance().removeMapLayer(layer_id))
+                QTimer.singleShot(4000, lambda layer_id=layer_id: self._remove_clone(layer_id))
 
     def _drop_view(self, i):
         if sip.isdeleted(self.canvases[i]):
@@ -360,7 +388,7 @@ class ViewsPanel(QDockWidget):
         if window is not None and not sip.isdeleted(window):
             window.close()
         del self.canvases[i], self.layers[i]
-        QTimer.singleShot(4000, lambda: QgsProject.instance().removeMapLayer(layer_id))
+        QTimer.singleShot(4000, lambda: self._remove_clone(layer_id))
 
     def close_all(self):
         for i in list(self.canvases):
@@ -423,6 +451,15 @@ class ViewsPanel(QDockWidget):
             self._pending[i] = timer
         self._pending[i].start(200)
 
+    def _apply_layer(self, i):
+        s, layer = self.settings[i], self.layers[i]
+        layer.setSubsetString(s.subset_string())
+        renderer = q3.QgsPointCloudLayer3DRenderer()
+        renderer.setLayer(layer)
+        renderer.setSymbol(self._symbol(s))
+        renderer.setPointRenderingBudget(s.budget())
+        layer.setRenderer3D(renderer)
+
     def _apply_now(self, i):
         self._pending.pop(i, None)
         if i not in self.canvases:
@@ -432,12 +469,7 @@ class ViewsPanel(QDockWidget):
             self.layers.pop(i, None)
             return
         s, layer, canvas = self.settings[i], self.layers[i], self.canvases[i]
-        layer.setSubsetString(s.subset_string())
-        renderer = q3.QgsPointCloudLayer3DRenderer()
-        renderer.setLayer(layer)
-        renderer.setSymbol(self._symbol(s))
-        renderer.setPointRenderingBudget(s.budget())
-        layer.setRenderer3D(renderer)
+        self._apply_layer(i)
         settings = canvas.mapSettings()
         wanted = [layer] if s.show_cloud else []
         if settings.layers() != wanted:

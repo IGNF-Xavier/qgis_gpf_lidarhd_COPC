@@ -52,6 +52,10 @@ chacune avec sa couche (clone, sans copie de données), ses couleurs et sa camé
 - **Histo** : champ coloré, plage affichée (classes hors plage en gris pour la classification), saturation des rampes, histogramme.
 - **Synchro** : caméras synchronisées, mode *Complet* ou *Position seule*.
 
+> ⚠️ **Non validé visuellement.** Le panneau crée les vues et applique les réglages (testé par script), mais le rendu des points 3D n'a pas pu
+> être vérifié : sur le poste de test (AMD Radeon intégré, pilote de 2022, QGIS 3.40.4 et 3.44.8) la scène 3D n'affiche que la carte 2D plaquée
+> sur le terrain, jamais les points. Un pilote graphique récent est conseillé ; retours bienvenus.
+
 Limites de cette version : histogramme et « Classer » calculés sur un échantillon (`pdal translate` + décimation, fichier local seulement) ;
 réglage des plages par champs numériques (pas de poignées sur l'histogramme) ; pas encore de découpage, de MNT, d'outils par vue
 ni de sauvegarde des vues dans le projet. Testé sur QGIS 3.40.4.
