@@ -5,7 +5,8 @@ import shutil
 import subprocess
 import tempfile
 
-from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
+from qgis.PyQt import sip
+from qgis.PyQt.QtCore import Qt, QThread, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QPainter
 from qgis.PyQt.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
                                  QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
@@ -27,20 +28,16 @@ class SampleThread(QThread):
     """Échantillonne le COPC avec `pdal translate` + filters.decimation (une fois par dalle, en tâche de fond)."""
     done = pyqtSignal(object, str)
 
-    def __init__(self, path, point_count, parent=None):
+    def __init__(self, path, point_count, pdal, env, parent=None):
         super().__init__(parent)
-        self.path, self.point_count = path, point_count
+        self.path, self.point_count, self.pdal, self.env = path, point_count, pdal, env
 
     def run(self):
-        pdal = shutil.which('pdal')
-        if not pdal:
-            self.done.emit(None, 'pdal introuvable')
-            return
+        pdal, env = self.pdal, self.env  # environnement construit dans le thread principal (API QGIS non thread-safe)
         step = max(1, int(self.point_count // 800000))
         folder = tempfile.mkdtemp(prefix='lidarhd_histo_')
         out = os.path.join(folder, 'sample.csv')
         try:
-            env, _ = build_pdal_environment(pdal)
             command = [pdal, 'translate', self.path, out, '--filters.decimation.step=%d' % step, '-f', 'filters.decimation',
                        '--writers.text.format=csv', '--writers.text.keep_unspecified=false']
             result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=900)
@@ -103,11 +100,13 @@ class ViewsPanel(QDockWidget):
         self.canvases, self.layers = {}, {}
         self.sample, self.sampler, self._loading = None, None, False
         self._syncing = False
+        self._pending = {}
         self._build()
 
     # ------------------------------------------------------------------ interface
     def _build(self):
         tabs = QTabWidget()
+        self.tabs = tabs
         self.setWidget(tabs)
         # --- onglet Vues
         views = QWidget()
@@ -207,7 +206,7 @@ class ViewsPanel(QDockWidget):
         self.status = QLabel('')
         hform.addRow(self.status)
         tabs.addTab(histo, 'Histo')
-        self.sync_on.toggled.connect(lambda on: None)
+        tabs.currentChanged.connect(lambda index: self._refresh_histo() if tabs.tabText(index) == 'Histo' else None)
         self._cloud_changed(self.cloud.currentLayer())
         self._view_changed()
 
@@ -284,9 +283,19 @@ class ViewsPanel(QDockWidget):
     def close_current(self):
         i = self.current()
         if i in self.canvases:
-            self.iface.closeMapCanvas3D(SCENE_NAMES[i])
-            QgsProject.instance().removeMapLayer(self.layers[i].id())
-            del self.canvases[i], self.layers[i]
+            self._drop_view(i)
+
+    def _drop_view(self, i):
+        """Ferme la vue puis retire la couche clonée APRÈS la destruction asynchrone de la scène 3D (sinon plantage QGIS)."""
+        layer_id = self.layers[i].id()
+        self._pending.pop(i, None)
+        self.iface.closeMapCanvas3D(SCENE_NAMES[i])
+        del self.canvases[i], self.layers[i]
+        QTimer.singleShot(4000, lambda: QgsProject.instance().removeMapLayer(layer_id))
+
+    def close_all(self):
+        for i in list(self.canvases):
+            self._drop_view(i)
 
     def recenter(self):
         self._recenter(self.current())
@@ -335,7 +344,23 @@ class ViewsPanel(QDockWidget):
         return symbol
 
     def apply(self, i):
+        """Regroupe les modifications rapprochées (évite de remplacer le rendu 3D pendant le chargement des nœuds)."""
         if i not in self.canvases:
+            return
+        if i not in self._pending:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda i=i: self._apply_now(i))
+            self._pending[i] = timer
+        self._pending[i].start(200)
+
+    def _apply_now(self, i):
+        self._pending.pop(i, None)
+        if i not in self.canvases:
+            return
+        if sip.isdeleted(self.canvases[i]) or sip.isdeleted(self.layers[i]):  # fenêtre fermée par sa croix
+            self.canvases.pop(i, None)
+            self.layers.pop(i, None)
             return
         s, layer, canvas = self.settings[i], self.layers[i], self.canvases[i]
         layer.setSubsetString(s.subset_string())
@@ -345,7 +370,9 @@ class ViewsPanel(QDockWidget):
         renderer.setPointRenderingBudget(s.budget())
         layer.setRenderer3D(renderer)
         settings = canvas.mapSettings()
-        settings.setLayers([layer] if s.show_cloud else [])
+        wanted = [layer] if s.show_cloud else []
+        if settings.layers() != wanted:
+            settings.setLayers(wanted)
         settings.setEyeDomeLightingEnabled(s.edl)
         settings.setEyeDomeLightingStrength(s.edl_strength)
         settings.setEyeDomeLightingDistance(int(round(s.edl_distance)))
@@ -460,7 +487,12 @@ class ViewsPanel(QDockWidget):
             self.status.setText('Histogramme disponible pour un fichier COPC, LAS ou LAZ local seulement.')
             return
         self.status.setText('Calcul de l’échantillon en tâche de fond…')
-        self.sampler = SampleThread(path, source.pointCount(), self)
+        pdal = shutil.which('pdal')
+        if not pdal:
+            self.status.setText('pdal introuvable.')
+            return
+        env, _ = build_pdal_environment(pdal)
+        self.sampler = SampleThread(path, source.pointCount(), pdal, env, self)
 
         def finished(data, error):
             self.sampler = None
@@ -504,7 +536,7 @@ class ViewsPanel(QDockWidget):
             self.histo.set_data(edges, counts, s.display_range, s.saturation)
         if self.sample:
             draw()
-        elif self._source() is not None and self.isVisible():
+        elif self._source() is not None and self.tabs.tabText(self.tabs.currentIndex()) == 'Histo':
             self._with_sample(draw)
 
     # ------------------------------------------------------------------ synchronisation des caméras

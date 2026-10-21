@@ -36,6 +36,7 @@ class Plugin:
             self.iface.removePluginMenu('&LiDAR HD Géoplateforme', self.action)
             self.action = None
         if self.panel:
+            self.panel.close_all()
             self.iface.removeDockWidget(self.panel)
             self.panel.deleteLater()
             self.panel = None
