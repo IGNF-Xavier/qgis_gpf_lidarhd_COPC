@@ -47,6 +47,7 @@ Points d'attention :
 Menu *Extensions › LiDAR HD Géoplateforme › Vues 3D LiDAR* : un panneau pour comparer 1 à 5 vues 3D d'une même dalle COPC,
 chacune avec sa couche (clone, sans copie de données), ses couleurs et sa caméra. Prérequis : QGIS ≥ 3.40.
 
+- **Récupération** : « Chercher les éditions » liste les dates du catalogue (dalles, date de ressource, points) sur l'emprise de la carte ; « Récupérer » lance l'extraction de l'édition choisie (plus récente, toutes, ou une date) et charge le COPC avec un rendu 2D explicite.
 - **Vues** : taille des points, qualité (1 / 2 / 5 M de points), relief EDL, rendu en triangles, recentrage, filtre de points
   (attribut, opérateur, valeur), tableau des *valeurs visibles* (« Classer » donne les pourcentages).
 - **Histo** : champ coloré, plage affichée (classes hors plage en gris pour la classification), saturation des rampes, histogramme.

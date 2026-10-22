@@ -1,5 +1,6 @@
 import json,os,re,shutil,time
 from qgis.core import *
+from .render import apply_default_renderer
 from .core import query_records,grouped,build_jobs,resolve_crs
 from .network import probe_url
 from .process_utils import run_pipeline,run_command_timeout
@@ -216,6 +217,7 @@ class ExtractEditionsAlgorithm(Base):
             if self.parameterAsBool(p,self.L,c):
                 layer=QgsPointCloudLayer(output,f'{prefix}_{edition}','copc')
                 if not layer.isValid():layer=QgsPointCloudLayer(output,f'{prefix}_{edition}','pdal')
+                if layer.isValid():f.pushInfo('Rendu 2D explicite : '+apply_default_renderer(layer))
                 if layer.isValid():c.temporaryLayerStore().addMapLayer(layer);c.addLayerToLoadOnCompletion(layer.id(),QgsProcessingContext.LayerDetails(f'{prefix}_{edition}',c.project(),self.OUT))
                 else:f.reportError('COPC créé mais chargement impossible : '+output,False)
         manifest=os.path.join(folder,prefix+'_manifest.json')

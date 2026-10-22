@@ -20,7 +20,7 @@ class InterfaceContractTests(unittest.TestCase):
     def test_plugin_version(self):
         parser = configparser.ConfigParser()
         parser.read(ROOT / 'metadata.txt', encoding='utf-8')
-        self.assertEqual(parser['general']['version'], '0.6.0')
+        self.assertEqual(parser['general']['version'], '0.6.1')
 
     def test_complete_processing_parameters_are_preserved(self):
         required_constants = {

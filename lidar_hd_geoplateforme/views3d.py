@@ -104,10 +104,15 @@ class ViewsPanel(QDockWidget):
         self._syncing = False
         self._pending = {}
         self.windows = {}
+        self.names = {}
+        self._counter = 0
+        self._reassert_timer = None
         for stale in [l for l in QgsProject.instance().mapLayers().values() if l.customProperty(CLONE_PROPERTY)]:
             QgsProject.instance().removeMapLayer(stale.id())  # clones orphelins d'une session précédente
         self._build()
         QgsProject.instance().layerWasAdded.connect(self._layer_added)
+        # QGIS remet les couches de toutes les cartes 3D à celles de la carte 2D dès que celle-ci change : on les rétablit.
+        self.iface.mapCanvas().layersChanged.connect(self._reassert_soon)
 
     # ------------------------------------------------------------------ interface
     def _build(self):
@@ -120,8 +125,15 @@ class ViewsPanel(QDockWidget):
         self.cloud = QgsMapLayerComboBox()
         self.cloud.setFilters(QgsMapLayerProxyModel.PointCloudLayer)
         self.cloud.layerChanged.connect(self._cloud_changed)
-        fetch = QPushButton('Récupérer une dalle COPC (emprise de la carte)…')
-        fetch.setToolTip('Ouvre le traitement « Extraire un COPC par édition » avec l’emprise courante de la carte 2D ; '
+        search = QPushButton('1. Chercher les éditions LiDAR HD (emprise de la carte)')
+        search.setToolTip('Interroge le WFS IGNF_LIDAR-HD_METADONNEE:metadata sur l’emprise courante de la carte 2D.')
+        search.clicked.connect(self.search_editions)
+        form.addRow(search)
+        self.editions = QComboBox()
+        self.editions.addItem('— lancer la recherche —', None)
+        form.addRow('Édition', self.editions)
+        fetch = QPushButton('2. Récupérer le COPC de l’édition choisie…')
+        fetch.setToolTip('Ouvre le traitement « Extraire un COPC par édition » avec l’emprise et l’édition choisies ; '
                          'le COPC produit est chargé dans le projet puis proposé dans la liste Nuage.')
         fetch.clicked.connect(self.fetch_copc)
         form.addRow(fetch)
@@ -138,7 +150,7 @@ class ViewsPanel(QDockWidget):
         self.view.currentIndexChanged.connect(self._view_changed)
         form.addRow('Vue', self.view)
         row = QHBoxLayout()
-        for text, slot in (('Ouvrir', self.open_current), ('Fermer', self.close_current), ('Recentrer', self.recenter)):
+        for text, slot in (('Ouvrir', self.open_current), ('Fermer', self.close_current), ('Recentrer', self.recenter), ('Rafraîchir', self.refresh_views)):
             b = QPushButton(text)
             b.clicked.connect(slot)
             row.addWidget(b)
@@ -298,12 +310,15 @@ class ViewsPanel(QDockWidget):
         self.layers[i] = layer
         self._apply_layer(i)  # rendu 3D prêt AVANT la création de la scène
         before = set(QApplication.topLevelWidgets())
-        canvas = self.iface.createNewMapCanvas3D(SCENE_NAMES[i])
+        self._counter += 1
+        name = f'{SCENE_NAMES[i]} #{self._counter}'  # nom unique : un nom réutilisé pouvait désigner une fenêtre en cours de destruction
+        canvas = self.iface.createNewMapCanvas3D(name)
         if canvas is None:
             QgsMessageLog.logMessage('createNewMapCanvas3D a échoué', TAG, Qgis.Warning)
             del self.layers[i]
             return
         self.canvases[i] = canvas
+        self.names[i] = name
         self._show_window(i, [w for w in QApplication.topLevelWidgets() if w not in before and isinstance(w, QDialog)], source.name())
         self._hide_clones_from_combo()
         canvas.cameraController().cameraChanged.connect(lambda i=i: self._camera_changed(i))
@@ -337,7 +352,7 @@ class ViewsPanel(QDockWidget):
         """QGIS nomme la fenêtre « Carte 3D N » et la crée flottante : titre explicite, taille, position en cascade, premier plan."""
         if not dialogs:
             return
-        window = next((w for w in dialogs if w.metaObject().className() == 'QDialog' and (w.windowTitle().startswith('Carte 3D') or w.windowTitle() == SCENE_NAMES[i])), None)  # exclut la boîte de mesure 3D
+        window = next((w for w in dialogs if w.metaObject().className() == 'QDialog' and (w.windowTitle().startswith('Carte 3D') or w.windowTitle().startswith(SCENE_NAMES[i]))), None)  # exclut la boîte de mesure 3D
         if window is None:
             return
         window.setWindowTitle(f'{SCENE_NAMES[i]} — {name}')
@@ -349,26 +364,92 @@ class ViewsPanel(QDockWidget):
         window.activateWindow()
         self.windows[i] = window
 
-    def fetch_copc(self):
-        """Lance l'algorithme d'extraction (interface Processing complète) avec l'emprise de la carte 2D."""
-        import processing
+    def _canvas_extent_text(self):
         canvas = self.iface.mapCanvas()
         extent, crs = canvas.extent(), canvas.mapSettings().destinationCrs()
+        return extent, crs
+
+    def search_editions(self):
+        """Interroge le WFS sur l'emprise de la carte et liste les éditions (date catalogue, dalles, date de ressource, points)."""
+        from qgis.core import QgsProcessingFeedback
+        from qgis.PyQt.QtWidgets import QApplication
+        from .core import grouped, query_records
+        extent, crs = self._canvas_extent_text()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            records, rejects, warnings, url = query_records(extent, crs, QgsProcessingFeedback())
+        except Exception as error:  # noqa: BLE001 - affiché à l'utilisateur
+            self.iface.messageBar().pushWarning(TAG, 'Recherche des éditions impossible : ' + str(error)[:300])
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        groups = grouped(records)
+        self.editions.clear()
+        if not groups:
+            self.editions.addItem('Aucune dalle LiDAR HD sur cette emprise', None)
+            return
+        self.editions.addItem('Plus récente — couverture composite par dalle', ('latest', ''))
+        self.editions.addItem('Toutes les éditions (un COPC par date)', ('all', ''))
+        for edition, items in groups.items():
+            dates = sorted({r.resource_date for r in items if r.resource_date})
+            points = sum(r.points or 0 for r in items)
+            label = f'{edition} — {len(items)} dalle(s)'
+            if dates:
+                label += f' — ressource {", ".join(dates)}'
+            if points:
+                label += f' — {points:,} points'.replace(',', ' ')
+            self.editions.addItem(label, ('selected', edition))
+        self.iface.messageBar().pushInfo(TAG, f'{len(groups)} édition(s) trouvée(s) sur l’emprise.')
+
+    def fetch_copc(self):
+        """Lance l'algorithme d'extraction (interface Processing complète) avec l'emprise et l'édition choisies."""
+        import processing
+        extent, crs = self._canvas_extent_text()
+        choice = self.editions.currentData()
+        if choice is None:
+            self.iface.messageBar().pushWarning(TAG, 'Lancer d’abord « Chercher les éditions » puis choisir une édition.')
+            return
+        mode, edition = choice
         text = f'{extent.xMinimum()},{extent.xMaximum()},{extent.yMinimum()},{extent.yMaximum()} [{crs.authid()}]'
-        processing.execAlgorithmDialog('lidarhd_geoplateforme:extract_editions',
-                                       {'EXTENT': text, 'EDITION_MODE': 1, 'RESOLUTION': 0.5, 'LOAD': True})
+        params = {'EXTENT': text, 'EDITION_MODE': {'all': 0, 'latest': 1, 'selected': 2}[mode], 'EDITIONS': edition,
+                  'RESOLUTION': 0.5, 'LOAD': True}
+        processing.execAlgorithmDialog('lidarhd_geoplateforme:extract_editions', params)
 
     def _layer_added(self, layer):
         """Un nuage de points qui vient d'être chargé (ex. COPC extrait) devient le nuage proposé."""
         if isinstance(layer, QgsPointCloudLayer) and not layer.customProperty(CLONE_PROPERTY):
             QTimer.singleShot(500, lambda: self.cloud.setLayer(layer) if not (sip.isdeleted(self.cloud) or sip.isdeleted(layer)) else None)
 
+    def _reassert_soon(self, *_):
+        if self._reassert_timer is None:
+            self._reassert_timer = QTimer(self)
+            self._reassert_timer.setSingleShot(True)
+            self._reassert_timer.timeout.connect(self._reassert_layers)
+        self._reassert_timer.start(400)
+
+    def _reassert_layers(self):
+        """Remet à chaque scène 3D sa propre couche (QGIS les avait réinitialisées sur les couches de la carte 2D)."""
+        for i in list(self.canvases):
+            if sip.isdeleted(self.canvases[i]) or i not in self.layers or sip.isdeleted(self.layers[i]):
+                continue
+            wanted = [self.layers[i]] if self.settings[i].show_cloud else []
+            settings = self.canvases[i].mapSettings()
+            if settings.layers() != wanted:
+                settings.setLayers(wanted)
+
+    def refresh_views(self):
+        """Réapplique rendu, filtre et couches de toutes les vues ouvertes (bouton Rafraîchir)."""
+        self._purge_dead()
+        for i in list(self.canvases):
+            self._apply_now(i)
+
     def _hide_clones_from_combo(self):
         self.cloud.setExceptedLayerList([l for l in QgsProject.instance().mapLayers().values() if l.customProperty(CLONE_PROPERTY)])
 
     def _purge_dead(self):
         """Vues dont la fenêtre 3D a été détruite (fermée par sa croix) : on libère leur clone, elles pourront être rouvertes."""
-        for i in [i for i, c in self.canvases.items() if sip.isdeleted(c)]:
+        for i in [i for i, c in self.canvases.items() if sip.isdeleted(c) or (i in self.windows and sip.isdeleted(self.windows[i]))]:
+            self.windows.pop(i, None)
             layer = self.layers.pop(i, None)
             del self.canvases[i]
             self._pending.pop(i, None)
@@ -384,7 +465,7 @@ class ViewsPanel(QDockWidget):
         layer_id = self.layers[i].id()
         self._pending.pop(i, None)
         window = self.windows.pop(i, None)
-        self.iface.closeMapCanvas3D(SCENE_NAMES[i])
+        self.iface.closeMapCanvas3D(self.names.pop(i, SCENE_NAMES[i]))
         if window is not None and not sip.isdeleted(window):
             window.close()
         del self.canvases[i], self.layers[i]
